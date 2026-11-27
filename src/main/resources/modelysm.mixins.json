@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "ui.modelysm.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "modelysm.refmap.json",
+  "mixins": [],
+  "client": [
+    "client.EntityRenderDispatcherMixin",
+    "client.FirstPersonRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

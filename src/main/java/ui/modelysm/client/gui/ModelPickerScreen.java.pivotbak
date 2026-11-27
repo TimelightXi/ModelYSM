@@ -1,0 +1,599 @@
+package ui.modelysm.client.gui;
+
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.math.Axis;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.LivingEntity;
+import ui.modelysm.ModelYSM;
+import ui.modelysm.client.ClientState;
+import ui.modelysm.client.ModelLibrary;
+import ui.modelysm.client.render.BedrockAnimation;
+import ui.modelysm.client.render.NpcRenderer;
+import ui.modelysm.common.EntitySettings;
+import ui.modelysm.network.Net;
+import ui.modelysm.network.packets.EntityActionC2S;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 官方 YSM 2.6.5 同款模型选择界面（对照 OpenYSM PlayerModelScreen 复刻）：
+ * 左侧 135px 预览面板（悬停模型 3D 大预览 + 名称 + 版本号），
+ * 右侧 5列x2行 卡片网格（每卡 52x90：scissor 3D 预览 + 底部名字条），
+ * 顶部搜索框，底部 前一页/页码/后一页。
+ */
+public class ModelPickerScreen extends Screen {
+    private final Screen parent;
+    private final UUID entityUuid;
+    private final String entityName;
+
+    private List<String> allModels = new ArrayList<>();
+    private List<String> models = new ArrayList<>();
+    private int page = 0;
+    private EditBox searchBox;
+
+    /** 卡片 3D 预览共用的虚拟实体（提供 health/tick 等 Molang 上下文） */
+    private LivingEntity dummy;
+
+    // 官方布局常量（420x235 总面板）
+    private static final int PANEL_W = 420, PANEL_H = 235;
+    private static final int LEFT_W = 135;
+    private static final int CARD_W = 52, CARD_H = 90, CARD_NAME_H = 20;
+
+    /**
+     * 官方卡片模型缩放：ModelButton 传给 renderLivingEntityPreview 的 scale 是 30.0f
+     * （早期按卡片尺寸/包围盒估算都不对，会偏大或被裁；这里是定值）。
+     */
+    private static final float CARD_MODEL_SCALE = 30f;
+
+    /** 官方左侧大预览用的缩放：InventoryScreen.renderEntityInInventoryFollowsMouse(..., 70) */
+    private static final float BIG_PREVIEW_SCALE = 70f;
+
+    /** 官方卡片的三个状态动画名（模型里存在才生效，否则官方就传 "empty"） */
+    private static final String ANIM_HOVER = "hover";
+    private static final String ANIM_HOVER_FADE = "hover_fadeout";
+    private static final String ANIM_EMPTY = "empty";
+
+    /** 每张卡片的 hover / 离开 hover 时间点，用于官方那套 hover → hover_fadeout → empty 状态机 */
+    private final java.util.Map<String, Long> hoverStartMs = new java.util.HashMap<>();
+    private final java.util.Map<String, Long> hoverEndMs = new java.util.HashMap<>();
+
+    private int guiLeft, guiTop;
+
+    public ModelPickerScreen(Screen parent, UUID entityUuid, String entityName, String currentModel) {
+        super(Component.literal("ModelYSM 模型选择"));
+        this.parent = parent;
+        this.entityUuid = entityUuid;
+        this.entityName = entityName;
+    }
+
+    /** 当前绑定的模型（动态读取，切换后同步包回来即刷新高亮） */
+    private String currentModel() {
+        EntitySettings es = ClientState.settingsFor(entityUuid);
+        return es != null ? es.model : null;
+    }
+
+    @Override
+    protected void init() {
+        allModels = new ArrayList<>(ModelLibrary.listModels());
+        allModels.sort(String::compareTo);
+        guiLeft = (width - PANEL_W) / 2;
+        guiTop = (height - PANEL_H) / 2;
+
+        String prev = searchBox != null ? searchBox.getValue() : "";
+        searchBox = new EditBox(Minecraft.getInstance().font, guiLeft + 143, guiTop + 6, 150, 14, Component.literal("搜索模型"));
+        searchBox.setValue(prev);
+        searchBox.setMaxLength(64);
+        addWidget(searchBox);
+
+        addRenderableWidget(Button.builder(Component.literal("§f前一页"), b -> {
+                    page = (page + pageCount() - 1) % pageCount();
+                }).bounds(guiLeft + 180, guiTop + PANEL_H - 18, 52, 14).build());
+        addRenderableWidget(Button.builder(Component.literal("§f后一页"), b -> {
+                    page = (page + 1) % pageCount();
+                }).bounds(guiLeft + 288, guiTop + PANEL_H - 18, 52, 14).build());
+        addRenderableWidget(Button.builder(Component.literal("§f返回"), b -> onClose())
+                .bounds(guiLeft + 350, guiTop + PANEL_H - 18, 52, 14).build());
+        refreshFiltered();
+    }
+
+    private void refreshFiltered() {
+        String q = searchBox != null ? searchBox.getValue().trim().toLowerCase(java.util.Locale.ROOT) : "";
+        models = new ArrayList<>();
+        for (String id : allModels) {
+            if (q.isEmpty()) { models.add(id); continue; }
+            ModelLibrary.LoadedModel lm = ModelLibrary.get(id);
+            String disp = lm != null && lm.displayName != null ? lm.displayName : id;
+            if (id.toLowerCase(java.util.Locale.ROOT).contains(q) || disp.toLowerCase(java.util.Locale.ROOT).contains(q)) {
+                models.add(id);
+            }
+        }
+        if (page >= pageCount()) page = Math.max(0, pageCount() - 1);
+    }
+
+    private int perPage() { return 10; }
+    private int pageCount() { return Math.max(1, (models.size() + perPage() - 1) / perPage()); }
+
+    /** 卡片坐标（官方：guiLeft+143 + 55*i, guiTop+28 + 93*row） */
+    private int cardX(int i) { return guiLeft + 143 + (CARD_W + 3) * (i % 5); }
+    private int cardY(int i) { return guiTop + 28 + (CARD_H + 3) * (i / 5); }
+
+    @Override
+    public void render(GuiGraphics g, int mouseX, int mouseY, float partialTick) {
+        renderBackground(g);
+        if (page >= pageCount()) page = pageCount() - 1;
+
+        // 面板底（官方同款深色）
+        g.fill(guiLeft, guiTop, guiLeft + LEFT_W, guiTop + PANEL_H, 0xF30E0E12);
+        g.fill(guiLeft + 138, guiTop, guiLeft + PANEL_W, guiTop + PANEL_H, 0xF30E0E12);
+        g.fill(guiLeft + LEFT_W, guiTop, guiLeft + 138, guiTop + PANEL_H, 0xFF1E232B);
+
+        // 标题 + 目标实体
+        g.drawString(font, "§b路径: §f模型选择", guiLeft + 4, guiTop - 12, 0xFFFFFF);
+        g.drawString(font, "§7目标: §f" + entityName, guiLeft + 4, guiTop + PANEL_H + 4, 0xFFFFFF);
+
+        searchBox.render(g, mouseX, mouseY, partialTick);
+        if (searchBox.getValue().isEmpty() && !searchBox.isFocused()) {
+            g.drawString(font, "§8搜索模型...", guiLeft + 147, guiTop + 9, 0x787878);
+        }
+
+        // ---- 左侧预览面板：渲染悬停的模型（无悬停则渲染当前绑定模型）----
+        String cur = currentModel();
+        String hoverId = hoveredModel(mouseX, mouseY);
+        String previewId = hoverId != null ? hoverId : cur;
+        if (previewId != null && ModelLibrary.get(previewId) != null) {
+            renderBigPreview(g, ModelLibrary.get(previewId), mouseX, mouseY, partialTick);
+            // 名称（官方：面板底部居中，超宽换行省略）
+            ModelLibrary.LoadedModel plm = ModelLibrary.get(previewId);
+            String disp = plm != null && plm.displayName != null ? plm.displayName : previewId;
+            List<String> lines = new ArrayList<>();
+            while (!disp.isEmpty() && font.width(disp) > LEFT_W - 10) {
+                int cut = disp.length();
+                while (cut > 0 && font.width(disp.substring(0, cut) + "…") > LEFT_W - 10) cut--;
+                if (cut == 0) break;
+                lines.add(disp.substring(0, cut) + (disp.length() > cut ? "…" : ""));
+                disp = disp.substring(cut);
+                if (lines.size() >= 2) break;
+            }
+            if (lines.size() < 2 && !disp.isEmpty()) lines.add(disp);
+            int ly = guiTop + PANEL_H - 14 - (lines.size() - 1) * 10;
+            for (String line : lines) {
+                g.drawCenteredString(font, line, guiLeft + LEFT_W / 2, ly, hoverId != null ? 0xFFFFC0 : 0xF3C060);
+                ly += 10;
+            }
+        } else {
+            g.drawCenteredString(font, "§8无模型", guiLeft + LEFT_W / 2, guiTop + PANEL_H - 14, 0x787878);
+        }
+        // 版本号（官方左下角深灰）
+        g.drawString(font, "§8ModelYSM 1.0.0", guiLeft + 2, guiTop + PANEL_H - 9, 0x3C3C3C);
+
+        // ---- 右侧卡片网格 ----
+        int start = page * perPage();
+        for (int i = 0; i < perPage() && start + i < models.size(); i++) {
+            String id = models.get(start + i);
+            ModelLibrary.LoadedModel lm = ModelLibrary.get(id);
+            int x = cardX(i), y = cardY(i);
+            boolean hover = mouseX >= x && mouseX < x + CARD_W && mouseY >= y && mouseY < y + CARD_H;
+            boolean isCur = id.equals(cur);
+
+            // 卡片底：官方 ModelButton.backgroundColor = 0xFF434242（未锁定时），
+            // 底色是"整卡垫底"的实色，gui 图（背景板/前景框）盖在上面、按 alpha 混合，
+            // 图里透明的地方露出的就是这块灰底 —— 官方卡片名字那一截的深色带其实是"灰底 + 图的下沿"。
+            g.fill(x, y, x + CARD_W, y + CARD_H, 0xFF434242);
+
+            // ① 背景板 + 3D（官方顺序：先铺 52x90 背景，再把 3D 裁到上方 70px）
+            if (lm != null) renderCard3D(g, lm, id, x, y, partialTick, hover, isCur);
+
+            // ② 名字：官方没有名字条底色，文字直接压在 gui 图上（y + h - 15）；
+            //    超过 45px 宽的名字用 font.split(.., 45) 折成两行，分别落在 y + h - 19 / y + h - 10。
+            //    阴影：官方 `guiGraphics.drawCenteredString(font, text, x, y, 15986656)` 走的是
+            //    GuiGraphics.drawString(..., dropShadow=true)，每行自带一层右下 1px 暗影；
+            //    这里改成显式 drawString(..., true)，逐行按 width/2 手工居中，参数与官方一致。
+            List<FormattedCharSequence> nameLines = font.split(
+                    Component.literal(lm != null && lm.displayName != null ? lm.displayName : id), 45);
+            int textCx = x + CARD_W / 2;
+            int textColor = 0xF3EFE0;   // 官方 15986656
+            if (nameLines.size() > 1) {
+                for (int li = 0; li < 2; li++) {
+                    FormattedCharSequence line = nameLines.get(li);
+                    g.drawString(font, line, textCx - font.width(line) / 2,
+                            y + CARD_H - 19 + li * 9, textColor, true);
+                }
+            } else {
+                FormattedCharSequence line = nameLines.isEmpty() ? FormattedCharSequence.EMPTY : nameLines.get(0);
+                g.drawString(font, line, textCx - font.width(line) / 2, y + CARD_H - 15, textColor, true);
+            }
+            // ③ 边框：官方 ModelButton 只在 `isHoveredOrFocused()` 时画 1px 0xFFF3EFE0 的四周，
+            //    平时（包括"当前选中"）没有任何边框 —— 之前那圈常亮的青色选中边是自造的，
+            //    会压住 gui_foreground 自带的框线，看起来就是"边框错位/双层框"。
+            int borderColor = hover ? 0xFFF3EFE0 : 0;
+            if (borderColor != 0) {
+                g.fill(x, y, x + CARD_W, y + 1, borderColor);
+                g.fill(x, y + CARD_H - 1, x + CARD_W, y + CARD_H, borderColor);
+                g.fill(x, y, x + 1, y + CARD_H, borderColor);
+                g.fill(x + CARD_W - 1, y, x + CARD_W, y + CARD_H, borderColor);
+            }
+        }
+        if (models.isEmpty()) {
+            g.drawCenteredString(font, "§8(无匹配模型)", guiLeft + 280, guiTop + 60, 0x787878);
+        }
+
+        // 页码（官方：底部居中）
+        g.drawCenteredString(font, (page + 1) + "/" + pageCount(), guiLeft + 261, guiTop + PANEL_H - 15, 0xF3C060);
+        super.render(g, mouseX, mouseY, partialTick);
+    }
+
+    /** 悬停的模型 id（右侧卡片区内） */
+    private String hoveredModel(double mouseX, double mouseY) {
+        int start = page * perPage();
+        for (int i = 0; i < perPage() && start + i < models.size(); i++) {
+            int x = cardX(i), y = cardY(i);
+            if (mouseX >= x && mouseX < x + CARD_W && mouseY >= y && mouseY < y + CARD_H) {
+                return models.get(start + i);
+            }
+        }
+        return null;
+    }
+
+    /** 卡片 3D 预览：与官方 ModelButton.renderWidget 完全同序 */
+    private void renderCard3D(GuiGraphics g, ModelLibrary.LoadedModel lm, String id,
+                              int cx, int cy, float partialTick,
+                              boolean hover, boolean selected) {
+        if (lm.defaultTexture() == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null) return;
+        if (dummy == null) dummy = EntityType.VILLAGER.create(mc.level);
+        if (dummy == null) return;
+
+        // 官方顺序：① 背景板按整卡 52x90 铺满（这里画的就是"底座"条）
+        //          ② 只把 3D 裁到上方 70px（scissor 不含背景）
+        //          ③ 前景板最后盖整卡
+        // 之前把背景板缩进 50x68 的预览区，底座条跟着被压缩上移 —— 这就是"底座卡不上"的原因。
+        if (lm.guiBackground != null) blitScaled(g, lm.guiBackground, cx, cy, CARD_W, CARD_H);
+        MultiBufferSource.BufferSource bs = mc.renderBuffers().bufferSource();
+        g.enableScissor(cx, cy, cx + CARD_W, cy + CARD_H - CARD_NAME_H);
+
+        PoseStack ps = g.pose();
+        ps.pushPose();
+        try {
+            boolean noRot = lm.disablePreviewRotation;
+            // 官方口径（ModelButton.renderWidget → ModelPreviewRenderer.renderLivingEntityPreview）：
+            //   translate(0, disable_preview_rotation ? 5.5 : 0, 1000) → scale(30) → Z180 → X(disable ? 0 : -10)
+            //   anchor = (x + 52/2, y + 90/2 + 20) = (cx+26, cy+65)
+            //
+            // 模型本体大小的唯一来源是 ysm.json 的 height_scale/width_scale：
+            //   官方 YSMFolderDeserializer 取缺省值 0.7（Blockbench 插件默认），显式写了才用自己写的。
+            //   酒狐 01_taisho_maid / 3_default_boy 都没写 → 官方按 0.7 渲染；
+            //   default 写了 0.7 → render() 里已经应用，这里不再重复乘。
+            // 之前的 0.85 / 背景层 0.7 / 垂直居中都属于自造系数，官方代码里没有，全部删除。
+            // 模型大小只由 height_scale/width_scale 决定（加载器已按官方口径补 0.7 缺省），
+            // NpcRenderer.render 里会乘上去；这里只给官方的 30px/格。
+            float scale = CARD_MODEL_SCALE;
+            // 官方 ModelPreviewRenderer:271 `poseStack.translate(0, disablePreviewRotation ? 5.5 : 0, 1000)`：
+            // 这一步发生在 `scale(1,1,-1)` 之后（只翻 Z，Y 仍是 GUI 轴向 = 向下），
+            // 所以 disable_preview_rotation 的模型要【往下】挪 5.5，不是往上。
+            // 之前写成减号 → 酒狐/default 这类 noRot 卡整整高了 11px（-5.5 vs +5.5），
+            // 和开了旋转的卡片摆在一起就是一排"高低不齐"。
+            float anchorY = cy + CARD_H / 2f + 20f + (noRot ? 5.5f : 0f);
+            ps.translate(cx + CARD_W / 2f, anchorY, 50);
+            ps.scale(scale, scale, -scale);
+            ps.mulPose(Axis.ZP.rotationDegrees(180f));
+            ps.mulPose(Axis.XP.rotationDegrees(noRot ? 0f : -10f));
+            // 官方卡片是固定机位（yaw = disable ? 180 : 200，X = disable ? 0 : -10），
+            // 没有转台/自旋。之前那 30°/s 的 Y 旋转是自造的，会让同一张卡在不同瞬间
+            // 的宽度和高低都不一样，横向比较时"每张卡都不一样大"。
+            float ox = 0, oy = 0, oz = 0;
+            if (!lm.model.rootBones.isEmpty()) {
+                var root = lm.model.rootBones.get(0);
+                ox = -root.mcPivot.x();
+                oy = -root.mcPivot.y();
+                oz = -root.mcPivot.z();
+            }
+            // 主循环动画：官方卡片一样一直播 preview_animation
+            // （Rossi 的 "gui" 就是从右侧翻进来→落定→之后耳朵/眼睛微动，100s 循环）
+            BedrockAnimation base = pickPreviewAnim(lm);
+            drivePreviewClock(base);
+            // hover / hover_fadeout 只作为叠加层（官方 card_widget 是独立状态槽，不替换主动画）
+            CardAnim overlay = cardOverlay(lm, id, hover, net.minecraft.Util.getMillis());
+            java.util.List<ui.modelysm.client.anim.ModelControllers.ActiveLayer> layers = null;
+            if (overlay.anim != null) {
+                ui.modelysm.client.anim.ModelControllers.CState cs = new ui.modelysm.client.anim.ModelControllers.CState();
+                cs.name = overlay.anim.name;
+                cs.animations.add(overlay.anim.name);
+                layers = java.util.List.of(new ui.modelysm.client.anim.ModelControllers.ActiveLayer(
+                        "gui_" + overlay.anim.name, cs, overlay.time));
+            }
+            // previewMode=true：官方卡片/预览是纯预览管线——只跑 preview_animation，
+            // 不叠玩家控制器（player.post_main / parallel / 装备层会把 gui 动画盖掉，
+            // 这就是"翻滚入场被跳过、只剩定姿"的原因）。
+            // 背景层不再做任何单独缩放/居中：官方 renderLivingEntityPreview 里背景骨
+            // 和身体走同一套 pose + scale(30)，框的大小完全由 height_scale(0.7) 决定。
+            NpcRenderer.PREVIEW_BG_SCALE = 0f;
+            NpcRenderer.PREVIEW_BG_CENTER_Y = 0f;
+            // 官方 ModelPreviewRenderer:325 `Lighting.setupForEntityInInventory()`：
+            // 卡片里的实体是用 GUI 投影直接画的，必须显式切换成"背包物品/实体预览"的两盏方向光
+            // （L0=(0.2,1,-0.7)、L1=(-0.2,1,0.7)，以 0xF000F0 最大亮度贴图）。
+            // 我们之前一次都没调用 → 用的是上一帧残留的等级光照方向，正面几乎拿不到漫反射，
+            // 整张卡就是"比官方暗一档、脸和衣服都是灰的"。
+            com.mojang.blaze3d.platform.Lighting.setupForEntityInInventory();
+            NpcRenderer.previewCullOff = true;
+            NpcRenderer.render(dummy, lm, base, noRot ? 180f : 200f, 0f, 0f, partialTick, ps, bs,
+                    0xF000F0, 1f, java.util.Set.of(), null, ox, oy, oz, true,
+                    null, 0f, 1f, layers);
+            NpcRenderer.previewCullOff = false;
+            bs.endBatch();
+            // 官方收尾 `Lighting.setupFor3DItems()`，恢复 GUI 3D 物品的默认光照
+            com.mojang.blaze3d.platform.Lighting.setupFor3DItems();
+        } finally {
+            ps.popPose();
+        }
+        // 3D 的 scissor 到这里结束：官方是 `RenderSystem.disableScissor()` 之后才 blit 前景板，
+        // 前景板按整卡 52x90 覆盖（含名字条那 20px）。我们之前把 disableScissor 放在 blit 之后，
+        // 前景图的底部 20px 被 3D 的裁剪框切掉 —— 这就是"末影龙娘的框底部没铺满"的真正原因。
+        g.disableScissor();
+        // 卡片前景层（官方 gui_foreground：blit 在 z=3500 覆盖整张卡 52x90）
+        blitScaled(g, lm.guiForeground, cx, cy, CARD_W, CARD_H);
+        // 按用户要求"完全来自模型"：界面不再补画任何边框/描边。
+    }
+
+    /** 一张叠加层动画 + 它自己的播放时间（秒） */
+    private static final class CardAnim {
+        final BedrockAnimation anim;
+        final float time;
+        CardAnim(BedrockAnimation anim, float time) { this.anim = anim; this.time = time; }
+    }
+
+    private static final CardAnim NO_OVERLAY = new CardAnim(null, 0f);
+
+    /**
+     * 官方 card_widget 的叠加状态槽（与主动画 preview_animation 并行）：
+     * <pre>
+     * hovered  -> play("hover")
+     * 刚移开   -> 离手时间 &lt; hover_fadeout 时长(时长 x 50ms) 时 play("hover_fadeout")
+     * 其余     -> 不叠加（官方传 "empty" = 不存在的动画名，等价于空层）
+     * </pre>
+     */
+    private CardAnim cardOverlay(ModelLibrary.LoadedModel lm, String id, boolean hover, long now) {
+        BedrockAnimation hoverAnim = lm.animations.get(ANIM_HOVER);
+        BedrockAnimation fadeAnim = lm.animations.get(ANIM_HOVER_FADE);
+
+        if (hover) {
+            if (hoverAnim == null) {
+                hoverStartMs.remove(id);
+                return NO_OVERLAY;
+            }
+            Long start = hoverStartMs.get(id);
+            if (start == null) {
+                start = now;
+                hoverStartMs.put(id, start);
+            }
+            hoverEndMs.remove(id);
+            return new CardAnim(hoverAnim, (now - start) / 1000f);
+        }
+
+        Long start = hoverStartMs.remove(id);
+        if (start != null) hoverEndMs.put(id, now);
+        Long end = hoverEndMs.get(id);
+        if (fadeAnim != null && end != null) {
+            float fadeMs = Math.max(0f, fadeAnim.length) * 1000f;
+            if (now - end < fadeMs) return new CardAnim(fadeAnim, (now - end) / 1000f);
+        }
+        return NO_OVERLAY;
+    }
+
+    /** 把内嵌 gui 图按真实像素比例拉伸到指定矩形（官方 ModelButton 对背景板/前景板都是 enableBlend + defaultBlendFunc） */
+    private static void blitScaled(GuiGraphics g, ResourceLocation rl, int x, int y, int w, int h) {
+        if (rl == null) return;
+        int[] sz = ModelLibrary.TEXTURE_SIZE.get(rl);
+        int tw = sz != null && sz[0] > 0 ? sz[0] : 256;
+        int th = sz != null && sz[1] > 0 ? sz[1] : 256;
+        com.mojang.blaze3d.systems.RenderSystem.enableBlend();
+        com.mojang.blaze3d.systems.RenderSystem.defaultBlendFunc();
+        g.blit(rl, x, y, w, h, 0f, 0f, tw, th, tw, th);
+        com.mojang.blaze3d.systems.RenderSystem.disableBlend();
+    }
+
+    /**
+     * background* 装饰层骨骼：只在子树方块数 ≤ 12 时才认定为"装饰层"（酒狐 Background1 = 4 根条）。
+     * 有些模型把整具身体挂在 Backgrounds 根下（那种隐藏会把人物删掉），用方块数区分。
+     */
+    private static java.util.Set<String> decorBgBones(ModelLibrary.LoadedModel lm) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (ui.modelysm.client.render.BedrockModel.Bone root : lm.model.rootBones) {
+            if (!root.name.toLowerCase(java.util.Locale.ROOT).contains("background")) continue;
+            if (countCubes(root) <= 12) out.add(root.name);
+        }
+        return out;
+    }
+
+    private static int countCubes(ui.modelysm.client.render.BedrockModel.Bone b) {
+        int n = b.cubes.size();
+        for (ui.modelysm.client.render.BedrockModel.Bone c : b.children) n += countCubes(c);
+        return n;
+    }
+
+/** 卡片预览动画：properties.preview_animation 优先 → gui → idle → 任意可用动画 */
+    private static BedrockAnimation pickPreviewAnim(ModelLibrary.LoadedModel lm) {
+        if (lm.previewAnimation != null) {
+            BedrockAnimation pa = lm.animations.get(lm.previewAnimation);
+            if (pa != null) return pa;
+        }
+        // 官方模型常用 "gui" 作为卡片姿态动画（Rossi / 小流萤 / 末影龙娘的 preview_animation 就是它）
+        BedrockAnimation gui = lm.animations.get("gui");
+        if (gui != null) return gui;
+        BedrockAnimation idle = lm.animations.get("idle");
+        if (idle != null) return idle;
+        return lm.animations.isEmpty() ? null : lm.animations.values().iterator().next();
+    }
+
+    /**
+     * 界面打开时刻：官方每张卡片是独立 mock player，界面一打开动画从 0 开始播
+     * （所以能看到"从右边翻进来"的开场）。这里用实例定时器，每次打开列表都重播开场。
+     */
+    private long previewT0 = System.nanoTime();
+
+    /**
+     * 驱动开场时间。注意：NpcRenderer 取的是 entity.getUUID() 的状态，
+     * dummy 是 villager，所以状态时钟必须写到 dummy 的 UUID 上，
+     * 写固定 "modelysm-card-preview" UUID 是无效的（上一版卡片卡死就是这个原因）。
+     */
+    private void drivePreviewClock(BedrockAnimation anim) {
+        float t = (float) ((System.nanoTime() - previewT0) / 1_000_000_000.0);
+        // 官方 AnimationTracker 对 loop=true 的动画是循环播放的（酒狐 gui 就是 loop=true、18s）。
+        // 之前这里不取模，18s 之后会一直采样到片段末尾的"下沉退场帧"
+        //（Root.position 14.88 = (0,-52,0)，整具人往下沉 3.25 格），
+        // 卡片上表现就是"只看到头顶/半张脸挂在名字条上方、上面一大块格子背板"。
+        if (anim != null && anim.loop && anim.length > 0.05f) {
+            t = t % anim.length;
+        }
+        if (dummy != null) applyPreviewState(dummy.getUUID(), anim, t);
+    }
+
+    /** 把指定实体 UUID 的预览状态时钟设成"某动画的第几秒" */
+    private static void applyPreviewState(java.util.UUID uuid, BedrockAnimation anim, float time) {
+        ui.modelysm.client.AnimStates.State st = ui.modelysm.client.AnimStates.get(uuid);
+        st.animTime = time;
+        st.evAnim = anim != null ? anim.name : null;
+        st.evTime = time;
+    }
+
+    /** 左侧大预览：鼠标水平位置驱动模型旋转（官方 renderEntityInInventoryFollowsMouse 同款） */
+    private void renderBigPreview(GuiGraphics g, ModelLibrary.LoadedModel lm, int mouseX, int mouseY, float partialTick) {
+        if (lm.defaultTexture() == null) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null) return;
+        if (dummy == null) dummy = EntityType.VILLAGER.create(mc.level);
+        if (dummy == null) return;
+
+        // 官方 PlayerModelScreen：scissor(guiLeft+5, guiTop+29, 125, 171)，
+        // 预览本体用 InventoryScreen.renderEntityInInventoryFollowsMouse(guiLeft+67, guiTop+190, 70)
+        // 并且不铺 gui_background / gui_foreground（面板底色由界面自己画）
+        int px = guiLeft + 5, py = guiTop + 29, pw = 125, ph = 171;
+        MultiBufferSource.BufferSource bs = mc.renderBuffers().bufferSource();
+        // 官方用 scissor 裁剪预览区
+        double guiScale = mc.getWindow().getGuiScale();
+        com.mojang.blaze3d.systems.RenderSystem.enableScissor(
+                (int) (px * guiScale),
+                (int) (mc.getWindow().getHeight() - (py + ph) * guiScale),
+                (int) (pw * guiScale), (int) (ph * guiScale));
+        PoseStack ps = g.pose();
+        ps.pushPose();
+        try {
+            // 官方左侧大预览：锚点 (guiLeft + 67, guiTop + 190)，缩放 70
+            float scale = BIG_PREVIEW_SCALE;
+            ps.translate(guiLeft + 67f, guiTop + 190f, 50);
+            ps.scale(scale, scale, -scale);
+            ps.mulPose(Axis.ZP.rotationDegrees(180f));
+            ps.mulPose(Axis.XP.rotationDegrees(-10f));
+            // 鼠标驱动水平旋转（官方 follows-mouse）
+            float follow = Mth.clamp((mouseX - (px + pw / 2f)) * 0.6f, -60f, 60f);
+            ps.mulPose(Axis.YP.rotationDegrees(follow));
+            float ox = 0, oy = 0, oz = 0;
+            if (!lm.model.rootBones.isEmpty()) {
+                var root = lm.model.rootBones.get(0);
+                ox = -root.mcPivot.x();
+                oy = -root.mcPivot.y();
+                oz = -root.mcPivot.z();
+            }
+            // 官方大预览 = 正常渲染实体本体（默认形态）。卡片那套 preview_animation
+            // （酒狐的 gui：18s 入场位移 + Root scale=2 + Background1 蓝/黄背板细条）
+            // 是给 52x90 小卡片摆拍用的，搬到大窗后连背板几何、开场大位移一起放大，
+            // 人物被顶出框、画面上出现几根彩色长条，根本没法观察。
+            // 因此这里不取 preview_animation，只按 rest 形态渲染，并隐藏 background* 骨骼。
+            java.util.Set<String> hideBg = new java.util.HashSet<>();
+            for (ui.modelysm.client.render.BedrockModel.Bone b : lm.model.bonesByName.values()) {
+                if (b.name.toLowerCase(java.util.Locale.ROOT).contains("background")) hideBg.add(b.name);
+            }
+            applyPreviewState(dummy.getUUID(), null, 0f);   // 预览时钟归零、无状态动画 = 静立默认形态
+            // 官方左侧大预览同样走 ModelPreviewRenderer → 同样需要 setupForEntityInInventory 的两盏方向光
+            com.mojang.blaze3d.platform.Lighting.setupForEntityInInventory();
+            NpcRenderer.previewCullOff = true;
+            NpcRenderer.render(dummy, lm, null, 180f, 0f, 0f, partialTick, ps, bs,
+                    0xF000F0, 1f, hideBg, null, ox, oy, oz, true);
+            NpcRenderer.previewCullOff = false;
+            bs.endBatch();
+            com.mojang.blaze3d.platform.Lighting.setupFor3DItems();
+        } finally {
+            ps.popPose();
+        }
+        com.mojang.blaze3d.systems.RenderSystem.disableScissor();
+    }
+
+    @Override
+    public void tick() {
+        super.tick();
+        if (searchBox != null) searchBox.tick();
+    }
+
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (searchBox != null && searchBox.isFocused() && keyCode == 256) {
+            searchBox.setFocused(false);
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
+    }
+
+    @Override
+    public boolean charTyped(char codePoint, int modifiers) {
+        if (searchBox != null && searchBox.charTyped(codePoint, modifiers)) {
+            refreshFiltered();
+            return true;
+        }
+        return super.charTyped(codePoint, modifiers);
+    }
+
+    @Override
+    public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        // 点击搜索框外的区域时取消搜索框焦点
+        if (searchBox != null && searchBox.isFocused()
+                && !(mouseX >= searchBox.getX() && mouseX < searchBox.getX() + searchBox.getWidth()
+                && mouseY >= searchBox.getY() && mouseY < searchBox.getY() + searchBox.getHeight())) {
+            searchBox.setFocused(false);
+        }
+        int start = page * perPage();
+        for (int i = 0; i < perPage() && start + i < models.size(); i++) {
+            String id = models.get(start + i);
+            int x = cardX(i), y = cardY(i);
+            if (mouseX >= x && mouseX < x + CARD_W && mouseY >= y && mouseY < y + CARD_H) {
+                if (!id.equals(currentModel())) {
+                    Net.CHANNEL.sendToServer(new EntityActionC2S(entityUuid, EntityActionC2S.SET_MODEL, id));
+                }
+                return true;
+            }
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    @Override
+    public boolean mouseScrolled(double mouseX, double mouseY, double delta) {
+        if (delta != 0 && mouseX >= guiLeft + 138 && mouseX <= guiLeft + PANEL_W
+                && mouseY >= guiTop && mouseY <= guiTop + PANEL_H) {
+            page = Mth.clamp(page + (delta > 0 ? -1 : 1), 0, pageCount() - 1);
+            return true;
+        }
+        return super.mouseScrolled(mouseX, mouseY, delta);
+    }
+
+    @Override
+    public void onClose() {
+        minecraft.setScreen(parent);
+    }
+
+    @Override
+    public boolean isPauseScreen() {
+        return false;
+    }
+}
+
