@@ -262,9 +262,9 @@ public class ModelWheelScreen extends Screen {
         bs.endBatch(ui.modelysm.client.ModelGuiRenderType.GUI_NO_CULL);
 
         // 中心文字：白底用深色字、蓝底用白字（drawCenteredString 的 color 参数在无 § 码时直接生效）
-        g.drawCenteredString(font, "⇄ 选择模型", (int) cx, (int) cy - 10, centerHover ? 0xFFFFFF : 0x2B2B2B);
-        g.drawCenteredString(font, "点击打开", (int) cx, (int) cy + 3, centerHover ? 0xFFFFFF : 0x606060);
-        g.drawCenteredString(font, entityName, (int) cx, (int) cy + 16, centerHover ? 0xFFFFFF : 0x505050);
+        // 实体名只在轮盘最上方显示一行：中心盘里再画一次会与顶部重复，且长 id 会压住扇区文字
+        g.drawCenteredString(font, "⇄ 选择模型", (int) cx, (int) cy - 7, centerHover ? 0xFFFFFF : 0x2B2B2B);
+        g.drawCenteredString(font, "点击打开", (int) cx, (int) cy + 6, centerHover ? 0xFFFFFF : 0x606060);
 
         // 扇区文字（名称白色 + 状态黄色，官方排版）
         String[] status = sectorStatus();

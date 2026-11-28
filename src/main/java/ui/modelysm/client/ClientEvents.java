@@ -78,6 +78,8 @@ public final class ClientEvents {
     }
     private static int devTestTicks = 0;
     private static boolean devTestPending = false;
+    /** 按过 V 但本地权限未知/不够，正在等服务端权限回包 */
+    private static boolean pendingWheelRequest = false;
 
     /** 【诊断】dev 冒烟：直读全部 .ysm（解密+反序列化+贴图注册），结果打日志 */
     private static void smokeTestDirectYsm() {
@@ -100,8 +102,46 @@ public final class ClientEvents {
         }
     }
 
-    /** 准星 8 格内找已绑定实体 → 打开轮盘 */
+    /**
+     * 按 V：先向服务端问一次权限（服务端权威），本地已知无权限就不弹界面，只等聊天栏提示。
+     * 本地允许时立即打开，不等回包（避免网络延迟造成的开界面卡顿）。
+     */
     private static void openWheel() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.screen != null) return;
+
+        Net.CHANNEL.sendToServer(new ui.modelysm.network.packets.WheelRequestC2S());
+        if (!canEditModels()) {
+            pendingWheelRequest = true;
+            return;
+        }
+        openWheelNow();
+    }
+
+    /** 本地判断：管理员，或单人存档（集成服务端同样不校验 OP，避免单机玩家锁死自己） */
+    private static boolean canEditModels() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.hasSingleplayerServer()) return true;
+        return ClientState.permLevel() >= 2;
+    }
+
+    /** 服务端权限回包：够权限且之前按过 V → 补开轮盘；权限被回收 → 关掉已打开的轮盘 */
+    public static void onPermissionUpdate(int level) {
+        Minecraft mc = Minecraft.getInstance();
+        if (pendingWheelRequest) {
+            pendingWheelRequest = false;
+            if (canEditModels()) {
+                openWheelNow();
+            }
+            return;
+        }
+        if (level < 2 && !mc.hasSingleplayerServer() && mc.screen instanceof ModelWheelScreen) {
+            mc.setScreen(null);
+        }
+    }
+
+    /** 准星 8 格内找已绑定实体 → 打开轮盘 */
+    private static void openWheelNow() {
         Minecraft mc = Minecraft.getInstance();
         LocalPlayer player = mc.player;
         if (player == null || mc.screen != null) return;

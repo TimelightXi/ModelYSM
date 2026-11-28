@@ -69,7 +69,12 @@ public class EntityActionC2S {
     public static void handle(EntityActionC2S msg, Supplier<NetworkEvent.Context> ctx) {
         ctx.get().enqueueWork(() -> {
             ServerPlayer player = ctx.get().getSender();
-            if (player == null || !player.hasPermissions(2)) return;
+            if (player == null) return;
+            // 服务端权威：非管理员一律拒绝（客户端就算改包绕过，也改不了任何设置）
+            if (!ui.modelysm.server.Perms.canEdit(player)) {
+                player.sendSystemMessage(Component.literal(ui.modelysm.server.Perms.DENY_EDIT));
+                return;
+            }
 
             ModelBindingStore store = ModelBindingStore.get();
             // ---- 绑定 / 解绑：唯一能在 GUI 里创建、删除绑定的入口（旧 /modelysm bind 已移除） ----

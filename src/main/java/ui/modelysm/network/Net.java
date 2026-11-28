@@ -8,16 +8,19 @@ import ui.modelysm.network.packets.ClientHelloC2S;
 import ui.modelysm.network.packets.EntityActionC2S;
 import ui.modelysm.network.packets.ModelChunkS2C;
 import ui.modelysm.network.packets.ModelRequestC2S;
+import ui.modelysm.network.packets.PermS2C;
 import ui.modelysm.network.packets.SyncNpcModelsS2C;
+import ui.modelysm.network.packets.WheelRequestC2S;
 
 /**
  * 自定义网络通道：
  *  C2S：ClientHello 客户端声明已安装；EntityAction GUI 修改实体设置；ModelRequest 请求下载模型
- *  S2C：SyncNpcModels 全量同步 绑定+设置；ModelChunk 模型分块下发
- * 版本 4：v3 增加配置变量/贴图索引，v4 增加模型流式分发
+ *       WheelRequest 按 V 问权限（普通玩家被服务端回绝）
+ *  S2C：SyncNpcModels 全量同步 绑定+设置；ModelChunk 模型分块下发；Perm 权限等级
+ * 版本 5：v3 增加配置变量/贴图索引，v4 增加模型流式分发，v5 增加轮盘权限校验
  */
 public final class Net {
-    private static final String VERSION = "4";
+    private static final String VERSION = "5";
     public static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(
             new ResourceLocation(ModelYSM.MODID, "main"),
             () -> VERSION, VERSION::equals, VERSION::equals);
@@ -30,5 +33,7 @@ public final class Net {
         CHANNEL.registerMessage(id++, EntityActionC2S.class, EntityActionC2S::encode, EntityActionC2S::decode, EntityActionC2S::handle);
         CHANNEL.registerMessage(id++, ModelRequestC2S.class, ModelRequestC2S::encode, ModelRequestC2S::decode, ModelRequestC2S::handle);
         CHANNEL.registerMessage(id++, ModelChunkS2C.class, ModelChunkS2C::encode, ModelChunkS2C::decode, ModelChunkS2C::handle);
+        CHANNEL.registerMessage(id++, WheelRequestC2S.class, WheelRequestC2S::encode, WheelRequestC2S::decode, WheelRequestC2S::handle);
+        CHANNEL.registerMessage(id++, PermS2C.class, PermS2C::encode, PermS2C::decode, PermS2C::handle);
     }
 }

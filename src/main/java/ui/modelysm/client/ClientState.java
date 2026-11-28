@@ -30,4 +30,15 @@ public final class ClientState {
     public static int size() {
         return bindings.size();
     }
+
+    /** 自己的权限等级（服务端 PermS2C 下发）：-1 未知、0 普通、1 帮助员、2+ 管理员 */
+    private static volatile int permLevel = -1;
+
+    public static void setPermLevel(int level) {
+        permLevel = level;
+    }
+
+    public static int permLevel() {
+        return permLevel;
+    }
 }
